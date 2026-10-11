@@ -35,17 +35,9 @@ function randomDelay(): number {
  */
 async function setInputContent(input: any, msg: string): Promise<boolean> {
   try {
-    // 平台自定义填入（优先）：部分站点对 ClipboardEvent('paste') 敏感
-    // （ChatGPT 会识别为"粘贴的文件"附件），由 provider.fillInput 覆盖。
-    try {
-      const provider = getCurrentProvider();
-      if (provider && typeof provider.fillInput === 'function') {
-        const r = await provider.fillInput(input, msg);
-        if (r) return true;
-      }
-    } catch (err: any) {
-      console.warn('[Cuckoo Code] provider.fillInput 失败，回退通用逻辑:', err && err.message);
-    }
+    // 不使用 provider.fillInput：其实现只要首次 execCommand 返回 true 便无条件返回成功，
+    // 既不做写入后读回、分片之间也不等待。实测会出现「execCommand 报告成功但编辑器内容为空」
+    // 被当作填入成功，进而发出空消息。统一走下方通用逻辑（含读回校验），各平台一致。
     if (input.tagName === 'TEXTAREA' || input.tagName === 'INPUT') {
       input.focus();
       const nativeSetter = Object.getOwnPropertyDescriptor(
@@ -58,25 +50,38 @@ async function setInputContent(input: any, msg: string): Promise<boolean> {
     }
     if (input.isContentEditable || input.getAttribute('contenteditable') === 'true') {
       input.focus();
-      document.execCommand('selectAll', false, undefined);
-      document.execCommand('delete', false, undefined);
+      // 清空现有内容：不用 execCommand('selectAll')，它选中的是「当前焦点所在的可编辑区域」，
+      // 当焦点未真正落入本输入框时会退化为全选整个文档（表现为页面文字被全部选中）。
+      // 改为在 input 内部显式建立 Range 选区，范围锁定在本元素，不依赖焦点位置。
+      try {
+        const sel = window.getSelection();
+        if (sel) {
+          const range = document.createRange();
+          range.selectNodeContents(input);
+          sel.removeAllRanges();
+          sel.addRange(range);
+          document.execCommand('delete', false, undefined);
+        }
+      } catch (_) { /* 选区失败不阻断：由下方读回校验兜底 */ }
 
-      // 分段 Paste：每段 ≤6000 字符，不会触发 ChatGPT 的附件行为，且每段都很快。
-      // 实测 12000 字符只需约 350ms。
+      // 分段插入：每段 ≤6000 字符，避免触发站点的"粘贴文件"附件行为。
+      // 用 execCommand('insertText') 而非合成 ClipboardEvent('paste')：
+      // 后者 isTrusted=false，ProseMirror 一类编辑器会拒收，导致写入静默失败。
       const CHUNK_SIZE = 6000;
       for (let i = 0; i < msg.length; i += CHUNK_SIZE) {
         const chunk = msg.slice(i, i + CHUNK_SIZE);
-        const dt = new DataTransfer();
-        dt.setData('text/plain', chunk);
-        const pasteEvent = new ClipboardEvent('paste', {
-          bubbles: true,
-          cancelable: true,
-          clipboardData: dt,
-        });
-        input.dispatchEvent(pasteEvent);
+        document.execCommand('insertText', false, chunk);
         if (i + CHUNK_SIZE < msg.length) {
           await new Promise(resolve => setTimeout(resolve, 50));
         }
+      }
+      // 读回校验：编辑器可能拒绝写入（受控组件/合成事件），不能无条件返回 true。
+      // 以去空白后长度 ≥ 期望的 90% 为准，容忍编辑器对空白与换行的处理差异。
+      const probe = msg.replace(/\s+/g, '');
+      const writtenCompact = getInputText(input).replace(/\s+/g, '');
+      if (!writtenCompact || writtenCompact.length < probe.length * 0.9) {
+        console.error('[Cuckoo Code] 输入框写入校验失败：期望约 ' + probe.length + ' 字，实际 ' + writtenCompact.length + ' 字');
+        return false;
       }
       return true;
     }
